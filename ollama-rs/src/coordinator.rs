@@ -11,6 +11,29 @@ use crate::{
     Ollama,
 };
 
+#[cfg(feature = "stream")]
+use async_stream::stream;
+#[cfg(feature = "stream")]
+use tokio_stream::{Stream, StreamExt};
+
+/// Events emitted during streaming chat with tool support
+#[cfg(feature = "stream")]
+#[derive(Debug, Clone)]
+pub enum CoordinatorStreamEvent {
+    /// Streaming content from initial LLM response
+    ContentChunk(String),
+    /// Tool execution started notification
+    ToolCallStarted { name: String, args: serde_json::Value },
+    /// Tool execution completed with result
+    ToolCallCompleted { name: String, result: String },
+    /// Streaming content from final LLM response (after tools)
+    FinalContentChunk(String),
+    /// Conversation completed
+    Done,
+    /// Error occurred during processing
+    Error(String),
+}
+
 /// A coordinator for managing chat interactions and tool usage.
 ///
 /// This struct is responsible for coordinating chat messages and tool
@@ -163,5 +186,195 @@ impl<C: ChatHistory> Coordinator<C> {
 
             Ok(resp)
         }
+    }
+
+    /// Chat with streaming support and tool execution notifications
+    #[cfg(feature = "stream")]
+    pub async fn chat_stream(
+        &mut self,
+        messages: Vec<ChatMessage>,
+    ) -> crate::error::Result<impl Stream<Item = CoordinatorStreamEvent> + '_> {
+        let s = stream! {
+            if self.debug {
+                for m in &messages {
+                    eprintln!("Hit {} with:", self.model);
+                    eprintln!("\t{:?}: '{}'", m.role, m.content);
+                }
+            }
+
+            // Phase 1: Stream initial response
+            let mut request = ChatMessageRequest::new(self.model.clone(), messages)
+                .options(self.options.clone())
+                .tools(self.tool_infos.clone());
+
+            if let Some(keep_alive) = &self.keep_alive {
+                request = request.keep_alive(keep_alive.clone());
+            }
+
+            if let Some(think) = &self.think {
+                request = request.think(*think);
+            }
+
+            if let Some(format) = &self.format {
+                if self.tool_infos.is_empty() {
+                    request = request.format(format.clone());
+                } else if let Some(last_message) = self.history.messages().last() {
+                    if last_message.role == MessageRole::Tool {
+                        request = request.format(format.clone());
+                    }
+                }
+            }
+
+            // Stream initial response, accumulating complete message
+            let mut stream = match self.ollama.send_chat_messages_stream(request).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    yield CoordinatorStreamEvent::Error(format!("Failed to start stream: {}", e));
+                    return;
+                }
+            };
+
+            let mut complete_message = None;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        // Yield content chunks as they arrive
+                        if !chunk.message.content.is_empty() {
+                            yield CoordinatorStreamEvent::ContentChunk(chunk.message.content.clone());
+                        }
+
+                        if chunk.done {
+                            complete_message = Some(chunk.message);
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        yield CoordinatorStreamEvent::Error("Stream error occurred".to_string());
+                        return;
+                    }
+                }
+            }
+
+            // Phase 2: Handle tool execution
+            if let Some(message) = complete_message {
+                // Add the assistant's message to history
+                self.history.push(message.clone());
+
+                if !message.tool_calls.is_empty() {
+                    for tool_call in message.tool_calls {
+                        if self.debug {
+                            eprintln!("Tool call: {:?}", tool_call.function);
+                        }
+
+                        // Notify tool execution started
+                        yield CoordinatorStreamEvent::ToolCallStarted {
+                            name: tool_call.function.name.clone(),
+                            args: tool_call.function.arguments.clone(),
+                        };
+
+                        // Execute tool
+                        let tool_result = match self.tools.get_mut(&tool_call.function.name) {
+                            Some(tool) => {
+                                match tool.call(tool_call.function.arguments).await {
+                                    Ok(result) => result,
+                                    Err(e) => {
+                                        yield CoordinatorStreamEvent::Error(
+                                            format!("Tool execution failed: {}", e)
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => {
+                                yield CoordinatorStreamEvent::Error(
+                                    format!("Unknown tool: {}", tool_call.function.name)
+                                );
+                                continue;
+                            }
+                        };
+
+                        if self.debug {
+                            eprintln!("Tool response: {}", &tool_result);
+                        }
+
+                        // Notify tool execution completed
+                        yield CoordinatorStreamEvent::ToolCallCompleted {
+                            name: tool_call.function.name,
+                            result: tool_result.clone(),
+                        };
+
+                        // Add tool result to chat history
+                        self.history.push(ChatMessage::tool(tool_result));
+                    }
+
+                    // Phase 3: Stream final response
+                    let mut final_request = ChatMessageRequest::new(self.model.clone(), vec![])
+                        .options(self.options.clone())
+                        .tools(self.tool_infos.clone());
+
+                    if let Some(keep_alive) = &self.keep_alive {
+                        final_request = final_request.keep_alive(keep_alive.clone());
+                    }
+
+                    if let Some(think) = &self.think {
+                        final_request = final_request.think(*think);
+                    }
+
+                    if let Some(format) = &self.format {
+                        final_request = final_request.format(format.clone());
+                    }
+
+                    // Use streaming for final response
+                    match self.ollama.send_chat_messages_stream(final_request).await {
+                        Ok(mut final_stream) => {
+                            while let Some(chunk_result) = final_stream.next().await {
+                                match chunk_result {
+                                    Ok(chunk) => {
+                                        if !chunk.message.content.is_empty() {
+                                            yield CoordinatorStreamEvent::FinalContentChunk(chunk.message.content.clone());
+                                        }
+
+                                        if chunk.done {
+                                            // Add final response to history
+                                            self.history.push(chunk.message.clone());
+                                            
+                                            if self.debug {
+                                                eprintln!(
+                                                    "Final response from {} of type {:?}: '{}'",
+                                                    chunk.model, chunk.message.role, chunk.message.content
+                                                );
+                                            }
+
+                                            // Check if more tool calls are needed (recursive case)
+                                            if !chunk.message.tool_calls.is_empty() {
+                                                // This would require recursive streaming, which is complex
+                                                // For now, we'll handle this as an error case
+                                                yield CoordinatorStreamEvent::Error(
+                                                    "Recursive tool calls not yet supported in streaming mode".to_string()
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        yield CoordinatorStreamEvent::Error("Final stream error occurred".to_string());
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield CoordinatorStreamEvent::Error(format!("Failed to start final stream: {}", e));
+                            return;
+                        }
+                    }
+                }
+            }
+
+            yield CoordinatorStreamEvent::Done;
+        };
+
+        Ok(s)
     }
 }
