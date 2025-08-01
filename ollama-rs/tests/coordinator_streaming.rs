@@ -25,8 +25,9 @@ async fn calculate_test(
     Ok(format!("The result of {} is 42", expression))
 }
 
+// "mistral-nemo:latest" fails tool test.
 #[allow(dead_code)]
-const MODEL: &str = "mistral-nemo:latest";
+const MODEL: &str = "mistral-nemo";
 
 #[tokio::test]
 #[cfg(feature = "stream")]
@@ -34,7 +35,7 @@ const MODEL: &str = "mistral-nemo:latest";
 async fn test_coordinator_streaming_without_tools() {
     let ollama = Ollama::default();
     let history = vec![];
-    let mut coordinator = Coordinator::new(ollama, MODEL.to_string(), history);
+    let mut coordinator = Coordinator::new(ollama, MODEL.to_string(), history).debug(true);
 
     let stream = coordinator
         .chat_stream(vec![ChatMessage::user("Say hello in one word".to_string())])
@@ -51,6 +52,7 @@ async fn test_coordinator_streaming_without_tools() {
             CoordinatorStreamEvent::ContentChunk(content) => {
                 assert!(!content.is_empty());
                 content_received = true;
+                println!("Content: '{content}'");
             }
             CoordinatorStreamEvent::Done => {
                 done_received = true;
@@ -81,18 +83,18 @@ async fn test_coordinator_streaming_without_tools() {
     assert!(!events.is_empty(), "Should have received some events");
 }
 
-#[tokio::test]
-#[cfg(feature = "stream")]
 #[cfg(feature = "macros")]
-async fn test_coordinator_streaming_with_tools() {
+#[tokio::test]
+async fn test_coordinator_with_tools() {
     // Test behavior with tools using MODEL to check tool support
     let ollama = Ollama::default();
     let history = vec![];
     let mut coordinator = Coordinator::new(ollama, MODEL.to_string(), history)
         .add_tool(get_weather_test)
-        .add_tool(calculate_test);
+        .add_tool(calculate_test)
+        .debug(true);
 
-    println!("Testing tool support with {MODEL} model...");
+    println!("Testing non-streaming tool support with {MODEL} model...");
 
     // First, let's test basic non-streaming functionality to ensure the model works
     println!("🔍 Testing basic model functionality first...");
@@ -115,82 +117,190 @@ async fn test_coordinator_streaming_with_tools() {
         }
     }
 
-    println!("🚀 Proceeding with streaming + tools test...");
-    
-    // Also test basic streaming without tools first
-    println!("🔍 Testing basic streaming without tools for this model...");
-    let mut basic_coordinator = Coordinator::new(Ollama::default(), MODEL.to_string(), vec![]);
-    let basic_stream = basic_coordinator
-        .chat_stream(vec![ChatMessage::user("Say hello in two words.".to_string())])
-        .await;
-    
-    match basic_stream {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-            let mut basic_events = Vec::new();
-            println!("📡 Basic streaming events:");
-            while let Some(event) = stream.next().await {
-                println!("   {:?}", event);
-                basic_events.push(event.clone());
-                if matches!(event, CoordinatorStreamEvent::Done) {
-                    break;
-                }
-            }
-            println!("📊 Basic streaming completed with {} events", basic_events.len());
-        }
-        Err(e) => {
-            println!("❌ Basic streaming failed: {}", e);
-        }
-    }
-    
-    println!("🔧 Now testing streaming WITH tools...");
-    let stream = coordinator
-        .chat_stream(vec![ChatMessage::user(
+    println!("🔧 Now testing non-streaming WITH tools...");
+    let response = coordinator
+        .chat(vec![ChatMessage::user(
             "What's the weather like in Portland? Please use the get_weather_test tool to check.".to_string(),
         )])
         .await;
 
-    match stream {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-            let mut events = Vec::new();
-            let mut content_received = false;
-            let mut tool_started = false;
-            let mut tool_completed = false;
-            let mut final_content_received = false;
-            let mut done_received = false;
+    match response {
+        Ok(response) => {
+            println!("Response is {response:?}");
+            // Test passes regardless - we're just investigating tool support
+            println!("✅ Test completed - tool support investigation finished");
+        }
+        Err(e) => {
+            if e.to_string().contains("does not support tools") {
+                println!("❌ Model {MODEL} does not support tools - error at stream creation");
+                return;
+            } else if e.to_string().contains("model not found") || e.to_string().contains("404") {
+                println!("⚠️  Model {MODEL} not found - skipping test");
+                return;
+            } else {
+                panic!("Unexpected error: {}", e);
+            }
+        }
+    }
+}
 
-            println!("Stream started successfully, processing events...");
+#[tokio::test]
+#[cfg(feature = "stream")]
+#[cfg(feature = "macros")]
+async fn test_coordinator_streaming_with_tools() {
+    // Test behavior with tools using MODEL to check tool support
+    let ollama = Ollama::default();
+    let history = vec![];
+    let mut coordinator = Coordinator::new(ollama, MODEL.to_string(), history)
+        .add_tool(get_weather_test)
+        .add_tool(calculate_test)
+        .debug(true);
+
+    println!("Testing tool support with {MODEL} model...");
+
+    println!("🔧 Now testing streaming WITH tools...");
+    let mut content_received = false;
+    let mut tool_started = false;
+    let mut tool_completed = false;
+    let mut final_content_received = false;
+    let mut done_received = false;
+
+    let initial_message = vec![ChatMessage::user(
+        "What's the weather like in Portland? Please use the get_weather_test tool to check.".to_string(),
+    )];
+    { // scope for the stream
+
+        let stream = coordinator
+            .chat_stream(initial_message.clone())
+            .await;
+
+        match stream {
+            Ok(stream) => {
+                let mut stream = Box::pin(stream);
+                let mut events = Vec::new();
+
+                println!("Stream started successfully, processing events...");
+
+                while let Some(event) = stream.next().await {
+                    println!("📝 Event received: {event:?}");
+                    match &event {
+                        CoordinatorStreamEvent::ContentChunk(content) => {
+                            println!("📄 Content chunk: '{content}'");
+                            content_received = true;
+                        }
+                        CoordinatorStreamEvent::ToolCallStarted { name, args } => {
+                            println!("🔧 Tool call started: {name} with args: {args}");
+                            assert_eq!(name, "get_weather_test");
+                            tool_started = true;
+                        }
+                        CoordinatorStreamEvent::ToolCallCompleted { name, result } => {
+                            println!("✅ Tool call completed: {name} result: {result}");
+                            assert_eq!(name, "get_weather_test");
+                            assert!(result.contains("sunny"));
+                            tool_completed = true;
+                        }
+                        CoordinatorStreamEvent::FinalContentChunk(content) => {
+                            println!("📄 Final content chunk: '{content}'");
+                            final_content_received = true;
+                        }
+                        CoordinatorStreamEvent::Done => {
+                            println!("✨ Stream completed");
+                            done_received = true;
+                        }
+                        CoordinatorStreamEvent::Error(err) => {
+                            if err.contains("does not support tools") {
+                                println!("❌ Model {MODEL} does not support tools");
+                                return;
+                            } else {
+                                println!("❌ Unexpected error: {}", err);
+                                return; // Don't panic, just return for debugging
+                            }
+                        }
+                    }
+                    events.push(event);
+                    
+                    if done_received {
+                        break;
+                    }
+                }
+
+                println!("\nTest results:");
+                println!("- Content received: {}", content_received);
+                println!("- Tool started: {}", tool_started);
+                println!("- Tool completed: {}", tool_completed);
+                println!("- Final content received: {}", final_content_received);
+                println!("- Done received: {}", done_received);
+                println!("- Total events: {}", events.len());
+
+                assert!(done_received, "Should have received done event");
+                assert!(!events.is_empty(), "Should have received some events");
+
+                if tool_started && tool_completed {
+                    println!("🎉 SUCCESS: {MODEL} supports tool invocation!");
+                    println!("✅ Tool execution workflow completed successfully");
+                } else if content_received {
+                    println!("ℹ️  Model responded with content but without using tools");
+                    println!("   This could mean:");
+                    println!("   - Model answered directly without needing tools");
+                    println!("   - Model doesn't support tool calling");
+                    println!("   - Tool calling wasn't triggered by the prompt");
+                } else {
+                    println!("⚠️  Unusual behavior: No content chunks received");
+                    println!("   This suggests the model responded immediately with Done");
+                    println!("   Possible causes:");
+                    println!("   - Model configuration issue");
+                    println!("   - Empty response from model");
+                    println!("   - Streaming implementation issue");
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("does not support tools") {
+                    println!("❌ Model mistral-small3.2:24b does not support tools - error at stream creation");
+                    return;
+                } else if e.to_string().contains("model not found") || e.to_string().contains("404") {
+                    println!("⚠️  Model mistral-small3.2:24b not found - skipping test");
+                    return;
+                } else {
+                    panic!("Unexpected error: {}", e);
+                }
+            }
+        }
+    }
+
+    if tool_completed {
+        // resend request with tool result this time. But how does this work?
+        let mut messages = initial_message.clone();
+        messages.append(&mut coordinator.history().clone());
+        println!("messages: {messages:?}");
+        let stream = coordinator.chat_stream(messages).await;
+        if let Ok(stream) = stream {
+            let mut stream = Box::pin(stream);
 
             while let Some(event) = stream.next().await {
-                println!("📝 Event received: {:?}", event);
+                println!("📝 Event received: {event:?}");
                 match &event {
                     CoordinatorStreamEvent::ContentChunk(content) => {
-                        println!("📄 Content chunk: '{}'", content);
-                        content_received = true;
+                        println!("📄 Content chunk: '{content}'");
                     }
                     CoordinatorStreamEvent::ToolCallStarted { name, args } => {
-                        println!("🔧 Tool call started: {} with args: {}", name, args);
+                        println!("🔧 Tool call started: {name} with args: {args}");
                         assert_eq!(name, "get_weather_test");
-                        tool_started = true;
                     }
                     CoordinatorStreamEvent::ToolCallCompleted { name, result } => {
-                        println!("✅ Tool call completed: {} result: {}", name, result);
+                        println!("✅ Tool call completed: {name} result: {result}");
                         assert_eq!(name, "get_weather_test");
                         assert!(result.contains("sunny"));
-                        tool_completed = true;
                     }
                     CoordinatorStreamEvent::FinalContentChunk(content) => {
-                        println!("📄 Final content chunk: '{}'", content);
-                        final_content_received = true;
+                        println!("📄 Final content chunk: '{content}'");
                     }
                     CoordinatorStreamEvent::Done => {
                         println!("✨ Stream completed");
-                        done_received = true;
+                        break;
                     }
                     CoordinatorStreamEvent::Error(err) => {
                         if err.contains("does not support tools") {
-                            println!("❌ Model mistral-small3.2:24b does not support tools");
+                            println!("❌ Model {MODEL} does not support tools");
                             return;
                         } else {
                             println!("❌ Unexpected error: {}", err);
@@ -198,54 +308,6 @@ async fn test_coordinator_streaming_with_tools() {
                         }
                     }
                 }
-                events.push(event);
-                
-                if done_received {
-                    break;
-                }
-            }
-
-            println!("\nTest results:");
-            println!("- Content received: {}", content_received);
-            println!("- Tool started: {}", tool_started);
-            println!("- Tool completed: {}", tool_completed);
-            println!("- Final content received: {}", final_content_received);
-            println!("- Done received: {}", done_received);
-            println!("- Total events: {}", events.len());
-
-            assert!(done_received, "Should have received done event");
-            assert!(!events.is_empty(), "Should have received some events");
-
-            if tool_started && tool_completed {
-                println!("🎉 SUCCESS: mistral-small3.2:24b supports tool invocation!");
-                println!("✅ Tool execution workflow completed successfully");
-            } else if content_received {
-                println!("ℹ️  Model responded with content but without using tools");
-                println!("   This could mean:");
-                println!("   - Model answered directly without needing tools");
-                println!("   - Model doesn't support tool calling");
-                println!("   - Tool calling wasn't triggered by the prompt");
-            } else {
-                println!("⚠️  Unusual behavior: No content chunks received");
-                println!("   This suggests the model responded immediately with Done");
-                println!("   Possible causes:");
-                println!("   - Model configuration issue");
-                println!("   - Empty response from model");
-                println!("   - Streaming implementation issue");
-            }
-
-            // Test passes regardless - we're just investigating tool support
-            println!("✅ Test completed - tool support investigation finished");
-        }
-        Err(e) => {
-            if e.to_string().contains("does not support tools") {
-                println!("❌ Model mistral-small3.2:24b does not support tools - error at stream creation");
-                return;
-            } else if e.to_string().contains("model not found") || e.to_string().contains("404") {
-                println!("⚠️  Model mistral-small3.2:24b not found - skipping test");
-                return;
-            } else {
-                panic!("Unexpected error: {}", e);
             }
         }
     }

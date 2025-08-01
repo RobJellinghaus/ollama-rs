@@ -57,6 +57,7 @@ modelfile = ["dep:modelfile", "dep:serde_with"]
 tokio = { version = "1", features = ["full"] }
 ollama-rs = { path = ".", features = [
     "stream",
+    "macros",
     "headers",
     "tool-implementations",
 ] }
